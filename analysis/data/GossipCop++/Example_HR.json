@@ -1,0 +1,16 @@
+//Placeholder. The real dataset is not included (copyright).
+//Download GossipCop++ from https://github.com/mbzuai-nlp/Fakenews-dataset
+//and place HF.json, MF.json, HR.json, MR.json in this folder.
+{
+  "0":{
+    "id":"gossipcop-1991455469",
+    "text":"",
+    "title":"",
+    "description":""
+  },
+  "1":{
+    "id":"",
+    "text":"",
+    "title":"",
+    "description":""
+  }}
