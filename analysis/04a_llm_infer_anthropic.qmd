@@ -1,0 +1,261 @@
+---
+title: "LLM inference — Claude Haiku 4.5 (Anthropic, Batch API)"
+format: html
+editor: visual
+---
+
+# What this file is
+
+A **standalone runner** for **Claude Haiku 4.5 (Anthropic)** — one model, so it never blocks behind the others. It reads the shared data (`../artifacts/gossip_model_data.csv`) and the frozen exemplar IDs (`../artifacts/llm_fewshot_exemplars_ids.csv`), reconstructs the exemplar text from the train split, and rebuilds the **identical** prompts every model uses, so rows and text are byte-for-byte the same. It writes:
+
+- `../artifacts/llm_preds_claude_haiku_zero.csv`
+- `../artifacts/llm_preds_claude_haiku_few.csv`
+
+When both exist, run [`04b_llm_eval.qmd`](04b_llm_eval.qmd) (it picks them up by filename).
+
+> **How to run.** Open in RStudio and **Run All Chunks** (Ctrl+Alt+R); do not `quarto render`. Claude Haiku uses Anthropic's **Message Batches API** (temperature 0): the job runs on Anthropic's servers and this file only submits then polls, saving the batch id to a `.json` state file. It is safe to interrupt — re-running resumes polling from that state (no re-submission, no double charge), and any regime whose output CSV already exists is skipped. Runs independently of the OpenAI and Gemini runners (different files, no collisions).
+
+# Setup: libraries
+
+```{r v192-libs}
+#| message: false
+#| warning: false
+
+# Standalone session: load everything this file needs on its own.
+# IMPORTANT: `withr` must be ATTACHED (not merely installed). ellmer 0.4.1's
+# batch code calls local_tempfile() without importing {withr}; attaching it here
+# lets that unqualified call resolve via the search path — for BOTH submitting a
+# batch AND retrieving a finished one. (This single line is what TFM_V19.1 had
+# and the first version of this file was missing.)
+pkgs <- c("tidyverse", "ellmer", "withr")
+missing <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(missing) > 0) install.packages(missing)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+cat("Loaded:", paste(pkgs, collapse = ", "), "\n")
+```
+
+# Shared data (same source of truth as every other model)
+
+```{r v192-data}
+#| message: true
+#| warning: false
+
+# ── Read the single shared modelling table; rebuild the exact test/train frames ─────────
+model_data_path <- "../artifacts/gossip_model_data.csv"
+stopifnot(file.exists(model_data_path))
+
+model_data <- readr::read_csv(model_data_path, show_col_types = FALSE) %>%
+  mutate(
+    subclass = factor(subclass, levels = c("HF", "MF", "HR", "MR")),
+    label    = factor(label,    levels = c("fake", "real")),
+    split    = factor(split,    levels = c("train", "validation", "test"))
+  )
+
+test_df  <- model_data %>% filter(split == "test")    # 2,796 rows — scored by all models
+train_df <- model_data %>% filter(split == "train")   # 60% — few-shot exemplars come from here
+
+cat("Loaded", nrow(model_data), "rows  |  test =", nrow(test_df),
+    " train =", nrow(train_df), "\n")
+```
+
+# The 8 frozen few-shot exemplars (identical to the main doc)
+
+```{r v192-exemplars}
+#| message: true
+#| warning: false
+
+llm_test <- test_df %>% select(doc_id, subclass, label, doc_text)
+stopifnot(nrow(llm_test) == 2796)
+
+# Frozen 8 few-shot exemplars (2 per subclass). Only doc_id+subclass+label are
+# committed (../artifacts/llm_fewshot_exemplars_ids.csv) — no article text on
+# GitHub — and the text is reconstructed by joining those IDs to train_df. If the
+# IDs file is absent, the identical 8 are regenerated from the fixed seed.
+exemplar_ids_path <- "../artifacts/llm_fewshot_exemplars_ids.csv"
+if (file.exists(exemplar_ids_path)) {
+  exemplar_ids <- readr::read_csv(exemplar_ids_path, show_col_types = FALSE)
+} else {
+  set.seed(2026)
+  exemplar_ids <- train_df %>%
+    group_by(subclass) %>%
+    slice_sample(n = 2) %>%
+    mutate(rep = row_number()) %>%
+    ungroup() %>%
+    arrange(rep, match(subclass, c("HF", "HR", "MF", "MR"))) %>%
+    transmute(doc_id, subclass = as.character(subclass), label = as.character(label))
+  readr::write_csv(exemplar_ids, exemplar_ids_path)
+}
+
+# Recover exemplar text from train_df by doc_id, preserving the frozen order.
+exemplars <- exemplar_ids %>%
+  mutate(subclass = factor(subclass, levels = c("HF", "MF", "HR", "MR")),
+         label    = as.character(label)) %>%
+  left_join(train_df %>% select(doc_id, doc_text), by = "doc_id")
+stopifnot(!any(is.na(exemplars$doc_text)))   # every exemplar id must be in train_df
+
+stopifnot(nrow(exemplars) == 8)
+stopifnot(length(intersect(exemplars$doc_id, llm_test$doc_id)) == 0)   # no leakage
+cat("Exemplar order (label):", paste(exemplars$label, collapse = ", "), "\n")
+```
+
+# Prompts, model registry, keys
+
+```{r v192-prompts}
+#| message: true
+#| warning: false
+
+sys_base <- paste(
+  "Read the following news article and determine whether it is real or fake",
+  "Answer with exactly one word, lowercase, with no punctuation and no explanation:",
+  "either fake or real.",
+  sep = "\n"
+)
+
+render_exemplars <- function(ex) {
+  blocks <- purrr::pmap_chr(
+    ex[c("doc_text", "label")],
+    function(doc_text, label) paste0("Article:\n", doc_text, "\n\nAnswer: ", label)
+  )
+  paste0(
+    "Here are labelled examples:\n\n",
+    paste(blocks, collapse = "\n\n---\n\n"),
+    "\n\nNow classify the next article in the same way."
+  )
+}
+
+sys_zero <- sys_base
+sys_few  <- paste(sys_base, render_exemplars(exemplars), sep = "\n\n")
+
+test_prompts <- as.list(paste0("Article:\n", llm_test$doc_text))
+stopifnot(length(test_prompts) == nrow(llm_test))
+
+models_spec <- tibble::tribble(
+  ~key,           ~provider,    ~model,                      ~method,
+  "gpt4o_mini",   "openai",     "gpt-4o-mini-2024-07-18",     "batch",
+  "claude_haiku", "anthropic",  "claude-haiku-4-5-20251001",  "batch",
+  "gemini_flash", "gemini",     "gemini-2.5-flash",           "parallel"
+)
+
+load_api_keys <- function(path = "API Keys.txt") {
+  if (!file.exists(path)) {
+    stop("API key file not found: ", normalizePath(path, mustWork = FALSE),
+         "\n  -> create 'API Keys.txt' with lines OPENAI_API_KEY=, ANTHROPIC_API_KEY=, GEMINI_API_KEY=")
+  }
+  lines <- trimws(readLines(path, warn = FALSE))
+  lines <- lines[nzchar(lines) & !startsWith(lines, "#") & grepl("=", lines, fixed = TRUE)]
+  env <- setNames(trimws(sub("^[^=]*=", "", lines)),
+                  trimws(sub("=.*$", "", lines)))
+  keys <- list(
+    openai    = unname(env["OPENAI_API_KEY"]),
+    anthropic = unname(env["ANTHROPIC_API_KEY"]),
+    gemini    = unname(env["GEMINI_API_KEY"])
+  )
+  miss <- names(keys)[vapply(keys, function(k) is.na(k) || !nzchar(k), logical(1))]
+  if (length(miss) > 0) {
+    stop("API Keys.txt is missing/blank for: ", paste(miss, collapse = ", "),
+         " (expected OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY)")
+  }
+  keys
+}
+
+make_chat <- function(provider, model, system_prompt, keys) {
+  switch(provider,
+    openai    = chat_openai(model = model, system_prompt = system_prompt,
+                            credentials = function() keys$openai,    params = params(temperature = 0)),
+    anthropic = chat_anthropic(model = model, system_prompt = system_prompt,
+                               credentials = function() keys$anthropic, params = params(temperature = 0)),
+    gemini    = chat_google_gemini(model = model, system_prompt = system_prompt,
+                                   credentials = function() keys$gemini, params = params(temperature = 0)),
+    stop("unknown provider: ", provider)
+  )
+}
+
+write_preds <- function(key, setting_name, raw) {
+  out_csv <- sprintf("../artifacts/llm_preds_%s_%s.csv", key, setting_name)
+  stopifnot(length(raw) == nrow(llm_test))             # positional alignment
+  tibble(
+    doc_id   = llm_test$doc_id,
+    subclass = as.character(llm_test$subclass),
+    truth    = as.character(llm_test$label),
+    setting  = setting_name,
+    model    = key,
+    raw      = raw
+  ) %>% readr::write_csv(out_csv)
+  message("✓ wrote ", out_csv, "  (", length(raw), " rows)")
+}
+```
+
+# Run Claude Haiku 4.5 (zero-shot and 8-shot) — resumable
+
+```{r v192-run}
+#| message: true
+#| warning: false
+
+# ── Belt-and-suspenders for the ellmer 0.4.1 local_tempfile bug ───────────────
+# Attaching withr (libraries chunk) is the real fix and covers every code path.
+# We ALSO shim withr::local_tempfile straight into the Anthropic batch_submit
+# method, in case withr is ever not on the search path. Wrapped so a name change
+# in ellmer internals can never stop the run.
+stopifnot(requireNamespace("withr", quietly = TRUE))
+local({
+  tryCatch({
+    gen <- ellmer:::batch_submit
+    cls <- ellmer:::ProviderAnthropic
+    m   <- S7::method(gen, cls)
+    env <- environment(m)
+    if (is.null(env) || !exists("local_tempfile", envir = env, inherits = FALSE)) {
+      shim <- new.env(parent = env)
+      shim$local_tempfile <- withr::local_tempfile
+      environment(m) <- shim
+      S7::method(gen, cls) <- m
+      message("[patch] shimmed withr::local_tempfile into Anthropic batch_submit.")
+    }
+  }, error = function(e)
+    message("[patch] Anthropic shim skipped (", conditionMessage(e),
+            "); relying on attached withr."))
+})
+
+api_keys <- load_api_keys()                  # errors early if the key file is missing
+this_key <- "claude_haiku"
+spec     <- models_spec %>% filter(key == this_key)
+settings <- list(zero = sys_zero, few = sys_few)
+
+# Submit (or resume) one Batch job, poll until done, write the CSV.
+# Resumes automatically on re-run: the .json state file holds the batch id.
+run_batch_setting <- function(setting_name, wait_s = 60) {
+  out_csv <- sprintf("../artifacts/llm_preds_%s_%s.csv", this_key, setting_name)
+  if (file.exists(out_csv)) {
+    message("✓ already complete, skipping: ", out_csv); return(invisible())
+  }
+
+  chat       <- make_chat(spec$provider, spec$model, settings[[setting_name]], api_keys)
+  state_path <- sprintf(".llm_%s_%s.json", this_key, setting_name)
+  message(">> ", this_key, " / ", setting_name,
+          "  (batch state: ", state_path, ")  submitting / resuming…")
+
+  repeat {
+    done <- tryCatch({
+      raw <- batch_chat_text(chat, test_prompts, path = state_path)
+      write_preds(this_key, setting_name, raw)
+      TRUE
+    }, error = function(e) {
+      msg <- conditionMessage(e)
+      # Only swallow transient NETWORK errors; auth / hash-mismatch are real.
+      if (grepl("resolve host|Failed to perform HTTP|Timeout|timed out|curl|Could not resolve|SSL|connection",
+                msg, ignore.case = TRUE)) {
+        message(sprintf("[net] %s\n      retrying in %ds (the batch keeps running on Anthropic's servers)…",
+                        msg, wait_s))
+        Sys.sleep(wait_s); FALSE
+      } else stop(e)
+    })
+    if (isTRUE(done)) break
+  }
+}
+
+for (s in names(settings)) run_batch_setting(s)
+
+message("\nClaude Haiku 4.5 done. Outputs: ",
+        paste(sprintf("llm_preds_%s_%s.csv", this_key, names(settings)), collapse = ", "),
+        "\nNext: run 04a_llm_infer_openai.qmd (GPT-4o-mini) and 04a_llm_infer_gemini.qmd (Gemini), then analysis/04b_llm_eval.qmd.")
+```

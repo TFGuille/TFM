@@ -1,0 +1,279 @@
+---
+title: "LLM inference — Gemini 2.5 Flash (parallel, row-level resume)"
+format: html
+editor: visual
+---
+
+# What this file is
+
+A **standalone runner** for **Gemini 2.5 Flash** — one model, so it never blocks behind the others. It reads the shared data (`../artifacts/gossip_model_data.csv`) and the frozen exemplar IDs (`../artifacts/llm_fewshot_exemplars_ids.csv`), reconstructs the exemplar text from the train split, and rebuilds the **identical** prompts every model uses, so rows and text are byte-for-byte the same. It writes:
+
+- `../artifacts/llm_preds_gemini_flash_zero.csv`
+- `../artifacts/llm_preds_gemini_flash_few.csv`
+
+When both exist, run [`04b_llm_eval.qmd`](04b_llm_eval.qmd) (it picks them up by filename).
+
+> **How to run.** Open in RStudio and **Run All Chunks** (Ctrl+Alt+R); do not `quarto render`. ellmer 0.4.1 has no server-side Batch API for Gemini, so requests run from your laptop with `parallel_chat_text()` (temperature 0) and are subject to your key's **rate limits** — a free-tier key (~10 req/min + a daily cap) will not finish the 5,592 requests in one sitting. The run is **row-level resumable**: each answer is appended to a partial file as it arrives, every run requests only the rows still missing, and two consecutive empty waves (quota exhausted) stop it cleanly — re-run later (the free tier resets daily) and it continues. On a paid key, raise `MAX_ACTIVE` in the run chunk for full speed.
+
+# Setup: libraries
+
+```{r v193-libs}
+#| message: false
+#| warning: false
+
+# Standalone session: load everything this file needs on its own.
+pkgs <- c("tidyverse", "ellmer")
+missing <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(missing) > 0) install.packages(missing)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+cat("Loaded:", paste(pkgs, collapse = ", "), "\n")
+```
+
+# Shared data (same source of truth as every other model)
+
+```{r v193-data}
+#| message: true
+#| warning: false
+
+# ── Read the single shared modelling table; rebuild the exact test/train frames ─────────
+model_data_path <- "../artifacts/gossip_model_data.csv"
+stopifnot(file.exists(model_data_path))
+
+model_data <- readr::read_csv(model_data_path, show_col_types = FALSE) %>%
+  mutate(
+    subclass = factor(subclass, levels = c("HF", "MF", "HR", "MR")),
+    label    = factor(label,    levels = c("fake", "real")),
+    split    = factor(split,    levels = c("train", "validation", "test"))
+  )
+
+test_df  <- model_data %>% filter(split == "test")    # 2,796 rows — scored by all models
+train_df <- model_data %>% filter(split == "train")   # 60% — few-shot exemplars come from here
+
+cat("Loaded", nrow(model_data), "rows  |  test =", nrow(test_df),
+    " train =", nrow(train_df), "\n")
+```
+
+# The 8 frozen few-shot exemplars (identical to the main doc)
+
+```{r v193-exemplars}
+#| message: true
+#| warning: false
+
+llm_test <- test_df %>% select(doc_id, subclass, label, doc_text)
+stopifnot(nrow(llm_test) == 2796)
+
+# Frozen 8 few-shot exemplars (2 per subclass). Only doc_id+subclass+label are
+# committed (../artifacts/llm_fewshot_exemplars_ids.csv) — no article text on
+# GitHub — and the text is reconstructed by joining those IDs to train_df. If the
+# IDs file is absent, the identical 8 are regenerated from the fixed seed.
+exemplar_ids_path <- "../artifacts/llm_fewshot_exemplars_ids.csv"
+if (file.exists(exemplar_ids_path)) {
+  exemplar_ids <- readr::read_csv(exemplar_ids_path, show_col_types = FALSE)
+} else {
+  set.seed(2026)
+  exemplar_ids <- train_df %>%
+    group_by(subclass) %>%
+    slice_sample(n = 2) %>%
+    mutate(rep = row_number()) %>%
+    ungroup() %>%
+    arrange(rep, match(subclass, c("HF", "HR", "MF", "MR"))) %>%
+    transmute(doc_id, subclass = as.character(subclass), label = as.character(label))
+  readr::write_csv(exemplar_ids, exemplar_ids_path)
+}
+
+# Recover exemplar text from train_df by doc_id, preserving the frozen order.
+exemplars <- exemplar_ids %>%
+  mutate(subclass = factor(subclass, levels = c("HF", "MF", "HR", "MR")),
+         label    = as.character(label)) %>%
+  left_join(train_df %>% select(doc_id, doc_text), by = "doc_id")
+stopifnot(!any(is.na(exemplars$doc_text)))   # every exemplar id must be in train_df
+
+stopifnot(nrow(exemplars) == 8)
+stopifnot(length(intersect(exemplars$doc_id, llm_test$doc_id)) == 0)   # no leakage
+cat("Exemplar order (label):", paste(exemplars$label, collapse = ", "), "\n")
+```
+
+# Prompts, model registry, keys
+
+```{r v193-prompts}
+#| message: true
+#| warning: false
+
+sys_base <- paste(
+  "Read the following news article and determine whether it is real or fake",
+  "Answer with exactly one word, lowercase, with no punctuation and no explanation:",
+  "either fake or real.",
+  sep = "\n"
+)
+
+render_exemplars <- function(ex) {
+  blocks <- purrr::pmap_chr(
+    ex[c("doc_text", "label")],
+    function(doc_text, label) paste0("Article:\n", doc_text, "\n\nAnswer: ", label)
+  )
+  paste0(
+    "Here are labelled examples:\n\n",
+    paste(blocks, collapse = "\n\n---\n\n"),
+    "\n\nNow classify the next article in the same way."
+  )
+}
+
+sys_zero <- sys_base
+sys_few  <- paste(sys_base, render_exemplars(exemplars), sep = "\n\n")
+
+test_prompts <- as.list(paste0("Article:\n", llm_test$doc_text))
+stopifnot(length(test_prompts) == nrow(llm_test))
+
+models_spec <- tibble::tribble(
+  ~key,           ~provider,    ~model,                      ~method,
+  "gpt4o_mini",   "openai",     "gpt-4o-mini-2024-07-18",     "batch",
+  "claude_haiku", "anthropic",  "claude-haiku-4-5-20251001",  "batch",
+  "gemini_flash", "gemini",     "gemini-2.5-flash",           "parallel"
+)
+
+load_api_keys <- function(path = "API Keys.txt") {
+  if (!file.exists(path)) {
+    stop("API key file not found: ", normalizePath(path, mustWork = FALSE),
+         "\n  -> create 'API Keys.txt' with lines OPENAI_API_KEY=, ANTHROPIC_API_KEY=, GEMINI_API_KEY=")
+  }
+  lines <- trimws(readLines(path, warn = FALSE))
+  lines <- lines[nzchar(lines) & !startsWith(lines, "#") & grepl("=", lines, fixed = TRUE)]
+  env <- setNames(trimws(sub("^[^=]*=", "", lines)),
+                  trimws(sub("=.*$", "", lines)))
+  keys <- list(
+    openai    = unname(env["OPENAI_API_KEY"]),
+    anthropic = unname(env["ANTHROPIC_API_KEY"]),
+    gemini    = unname(env["GEMINI_API_KEY"])
+  )
+  miss <- names(keys)[vapply(keys, function(k) is.na(k) || !nzchar(k), logical(1))]
+  if (length(miss) > 0) {
+    stop("API Keys.txt is missing/blank for: ", paste(miss, collapse = ", "),
+         " (expected OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY)")
+  }
+  keys
+}
+
+# NB: for Gemini 2.5 Flash do NOT set a tiny max_tokens — its internal
+# "thinking" can otherwise consume the budget and return empty text; the
+# one-word instruction keeps outputs short on its own.
+make_chat <- function(provider, model, system_prompt, keys) {
+  switch(provider,
+    openai    = chat_openai(model = model, system_prompt = system_prompt,
+                            credentials = function() keys$openai,    params = params(temperature = 0)),
+    anthropic = chat_anthropic(model = model, system_prompt = system_prompt,
+                               credentials = function() keys$anthropic, params = params(temperature = 0)),
+    gemini    = chat_google_gemini(model = model, system_prompt = system_prompt,
+                                   credentials = function() keys$gemini, params = params(temperature = 0)),
+    stop("unknown provider: ", provider)
+  )
+}
+
+write_preds <- function(key, setting_name, raw) {
+  out_csv <- sprintf("../artifacts/llm_preds_%s_%s.csv", key, setting_name)
+  stopifnot(length(raw) == nrow(llm_test))             # positional alignment
+  tibble(
+    doc_id   = llm_test$doc_id,
+    subclass = as.character(llm_test$subclass),
+    truth    = as.character(llm_test$label),
+    setting  = setting_name,
+    model    = key,
+    raw      = raw
+  ) %>% readr::write_csv(out_csv)
+  message("✓ wrote ", out_csv, "  (", length(raw), " rows)")
+}
+```
+
+# Run Gemini 2.5 Flash (zero-shot and 8-shot) — row-level resumable
+
+```{r v193-run}
+#| message: true
+#| warning: false
+
+api_keys <- load_api_keys()                  # errors early if the key file is missing
+this_key <- "gemini_flash"
+spec     <- models_spec %>% filter(key == this_key)
+settings <- list(zero = sys_zero, few = sys_few)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TUNING  (the only two knobs you should touch)
+#   max_active : how many requests run at once.
+#                FREE tier  -> keep LOW (3–5) or you just trip the 10/min limit.
+#                PAID tier  -> raise to 40–100 for ~10–50× speed.
+#   batch_size : rows requested per wave; results are saved after EVERY wave, so
+#                smaller = more frequent checkpoints (and more visible progress).
+MAX_ACTIVE <- 40   # billing enabled (paid tier) -> high concurrency is fine
+BATCH_SIZE <- 50
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Run one regime. Keeps a partial CSV of successful (doc_id, raw) rows; each run
+# requests ONLY the rows still missing and appends new successes immediately. If
+# two waves in a row come back completely empty, the quota is exhausted / you are
+# rate-limited, so it stops cleanly (re-run later — progress is saved).
+run_gemini_setting <- function(setting_name, max_active = MAX_ACTIVE, batch_size = BATCH_SIZE) {
+  out_csv <- sprintf("../artifacts/llm_preds_%s_%s.csv", this_key, setting_name)
+  if (file.exists(out_csv)) {
+    message("✓ already complete, skipping: ", out_csv); return(invisible())
+  }
+
+  chat        <- make_chat(spec$provider, spec$model, settings[[setting_name]], api_keys)
+  partial_csv <- sprintf(".llm_%s_%s_partial.csv", this_key, setting_name)
+
+  all_ids       <- llm_test$doc_id
+  prompts_by_id <- setNames(test_prompts, all_ids)        # doc_id -> prompt
+
+  # What did earlier runs already finish?
+  done <- tibble(doc_id = character(), raw = character())
+  if (file.exists(partial_csv)) {
+    done <- readr::read_csv(partial_csv, show_col_types = FALSE,
+                            col_types = readr::cols(.default = "c")) %>%
+            filter(!is.na(raw)) %>% distinct(doc_id, .keep_all = TRUE)
+  }
+  todo_ids <- setdiff(all_ids, done$doc_id)
+  message(sprintf(">> %s / %s : %d already done, %d to go (max_active=%d, batch=%d)",
+                  this_key, setting_name, nrow(done), length(todo_ids), max_active, batch_size))
+
+  if (length(todo_ids) > 0) {
+    waves <- split(todo_ids, ceiling(seq_along(todo_ids) / batch_size))
+    consecutive_fail <- 0L
+    for (w in seq_along(waves)) {
+      ids <- waves[[w]]
+      res <- parallel_chat_text(chat, unname(prompts_by_id[ids]),
+                                max_active = max_active, on_error = "continue")
+      ok  <- !is.na(res)
+      if (any(ok)) {
+        readr::write_csv(tibble(doc_id = ids[ok], raw = res[ok]),
+                         partial_csv, append = file.exists(partial_csv))
+        done <- bind_rows(done, tibble(doc_id = ids[ok], raw = res[ok]))
+      }
+      message(sprintf("   wave %d/%d: +%d ok, %d failed  |  total %d/%d",
+                      w, length(waves), sum(ok), sum(!ok), nrow(done), length(all_ids)))
+
+      consecutive_fail <- if (sum(ok) == 0) consecutive_fail + 1L else 0L
+      if (consecutive_fail >= 2) {
+        message("   ⏸ Two waves failed in a row — Gemini is rate-limited or the daily quota is used up.\n",
+                "      Progress is SAVED in ", partial_csv, ". Re-run this file later to continue\n",
+                "      (free tier resets daily), or enable billing / raise MAX_ACTIVE for higher limits.")
+        return(invisible())
+      }
+    }
+  }
+
+  # Complete? Assemble in the original test order and write the final CSV.
+  final     <- tibble(doc_id = all_ids) %>% left_join(done, by = "doc_id")
+  n_missing <- sum(is.na(final$raw))
+  if (n_missing > 0) {
+    message(sprintf("   still missing %d row(s) — re-run later to finish (progress saved in %s).",
+                    n_missing, partial_csv))
+    return(invisible())
+  }
+  write_preds(this_key, setting_name, final$raw)
+  message("   complete — you can delete ", partial_csv, " now if you like.")
+}
+
+for (s in names(settings)) run_gemini_setting(s)
+
+message("\nGemini pass finished. If a regime stopped early, just run this file again later.\n",
+        "When llm_preds_gemini_flash_zero.csv AND llm_preds_gemini_flash_few.csv both exist in ../artifacts,\n",
+        "run analysis/04b_llm_eval.qmd (after the OpenAI and Anthropic runners).")
+```

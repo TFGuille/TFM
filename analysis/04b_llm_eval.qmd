@@ -1,0 +1,220 @@
+---
+title: "04b_llm_eval"
+format: html
+editor: visual
+---
+
+The LLM runners (`04a_llm_infer_*.qmd`) write raw one-word answers to `../artifacts/`. Here we parse them to labels — scoring any unresolved row as incorrect, so a parse failure can never inflate accuracy — and evaluate with the same helpers as `02` (ML) and `03` (BERT). No probability is available, so the per-subclass `Predicted_Fake_Rate` carries the detector-bias signal and `Mean_Prob_Fake` is not interpreted for the LLMs. This notebook needs only the committed prediction files — no dataset, no API access. The final chunk reads the all-detector table `03` wrote and folds in the LLM rows.
+
+```{r setup}
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(caret)
+
+art_dir <- "../artifacts"
+res_dir <- "../results"
+tab_dir <- file.path(res_dir, "tables")
+fig_dir <- file.path(res_dir, "figures")
+dir.create(tab_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ── Shared evaluation helpers  ─────────────────────────────────
+extract_binary_metrics <- function(cm, model_name) {
+  tibble(
+    Model               = model_name,
+    Accuracy            = as.numeric(cm$overall["Accuracy"]),
+    Precision           = as.numeric(cm$byClass["Precision"]),
+    Recall              = as.numeric(cm$byClass["Recall"]),
+    F1                  = as.numeric(cm$byClass["F1"]),
+    Specificity         = as.numeric(cm$byClass["Specificity"]),
+    `Balanced Accuracy` = as.numeric(cm$byClass["Balanced Accuracy"])
+  )
+}
+evaluate_global <- function(pred, truth, model_name) {
+  cm <- caret::confusionMatrix(factor(pred,  c("real", "fake")),
+                               factor(truth, c("real", "fake")),
+                               positive = "fake", mode = "everything")
+  extract_binary_metrics(cm, model_name)
+}
+subclass_breakdown <- function(truth, pred, prob_fake, subclass) {
+  tibble(subclass = subclass, truth = truth, pred = pred, prob_fake = prob_fake) %>%
+    group_by(subclass) %>%
+    summarise(n = n(), Accuracy = mean(pred == truth),
+              Predicted_Fake_Rate = mean(pred == "fake"),
+              Mean_Prob_Fake = mean(prob_fake), .groups = "drop")
+}
+
+# ── Model registry (keys to find files; pretty labels for tables) ─────────────
+llm_keys     <- c("gpt4o_mini", "claude_haiku", "gemini_flash")
+llm_settings <- c("zero", "few")
+model_labels <- c(gpt4o_mini = "GPT-4o-mini", claude_haiku = "Claude Haiku 4.5",
+                  gemini_flash = "Gemini 2.5 Flash")
+pretty_name <- function(key, setting)
+  paste0(model_labels[[key]], " (", c(zero = "zero-shot", few = "8-shot")[[setting]], ")")
+
+# Strict parser: exactly one of "fake"/"real" -> that label; both/neither -> NA.
+parse_label <- function(x) {
+  t <- str_to_lower(str_trim(ifelse(is.na(x), "", x)))
+  dplyr::case_when(str_detect(t, "fake") & !str_detect(t, "real") ~ "fake",
+                   str_detect(t, "real") & !str_detect(t, "fake") ~ "real",
+                   TRUE ~ NA_character_)
+}
+
+# Human-adjudicated review of parse failures (auditable, optional, preserves edits).
+review_path <- file.path(art_dir, "llm_parse_review.csv")
+load_overrides <- function(path = review_path) {
+  if (!file.exists(path)) return(NULL)
+  ov <- readr::read_csv(path, show_col_types = FALSE) %>%
+    filter(!is.na(manual_label) & nzchar(trimws(manual_label))) %>%
+    transmute(model, setting, doc_id, manual_label = str_to_lower(trimws(manual_label)))
+  if (nrow(ov) == 0) return(NULL)
+  bad <- setdiff(unique(ov$manual_label), c("fake", "real"))
+  if (length(bad) > 0) stop("manual_label must be 'fake'/'real'; got: ", paste(bad, collapse = ", "))
+  ov
+}
+
+# Final label = parser result, else manual label; still-unresolved -> scored WRONG.
+load_llm_preds <- function(key, setting_name, overrides = load_overrides()) {
+  f <- file.path(art_dir, sprintf("llm_preds_%s_%s.csv", key, setting_name))
+  if (!file.exists(f)) return(NULL)
+  d <- readr::read_csv(f, show_col_types = FALSE) %>%
+    mutate(model = key, setting = setting_name, auto_parsed = parse_label(raw))
+  ov <- if (is.null(overrides)) NULL else filter(overrides, model == key, setting == setting_name)
+  if (!is.null(ov) && nrow(ov) > 0) d <- left_join(d, ov[c("doc_id", "manual_label")], by = "doc_id")
+  else d$manual_label <- NA_character_
+  d %>% mutate(
+    final    = dplyr::coalesce(auto_parsed, manual_label),
+    auto_ok  = !is.na(auto_parsed),
+    resolved = !is.na(final),
+    truth    = factor(truth, levels = c("real", "fake")),
+    pred_chr = dplyr::if_else(resolved, final, dplyr::if_else(truth == "fake", "real", "fake")),
+    pred     = factor(pred_chr, levels = c("real", "fake")),
+    subclass = factor(subclass, levels = c("HF", "MF", "HR", "MR"))
+  )
+}
+```
+
+## Global + subclass metrics
+
+```{r llm-eval}
+#| message: true
+#| warning: false
+
+llm_pred_list    <- list()
+llm_metrics_list <- list()
+for (k in llm_keys) for (s in llm_settings) {
+  d <- load_llm_preds(k, s)
+  if (is.null(d)) { message("· missing LLM predictions: ", k, " ", s); next }
+  nm <- pretty_name(k, s)
+  llm_pred_list[[nm]] <- d
+  cat(sprintf("%-26s auto-parse fail: %.2f%% | unresolved after review: %d\n",
+              nm, 100 * mean(!d$auto_ok), sum(!d$resolved)))
+  llm_metrics_list[[nm]] <- evaluate_global(d$pred, d$truth, nm)
+}
+
+if (length(llm_metrics_list) > 0) {
+  llm_metrics <- bind_rows(llm_metrics_list)
+  readr::write_csv(llm_metrics, file.path(tab_dir, "llm_metrics.csv"))
+
+  llm_subclass_results <- purrr::imap_dfr(llm_pred_list, function(d, nm)
+    subclass_breakdown(d$truth, d$pred, as.numeric(d$pred == "fake"), d$subclass) %>%
+      mutate(Model = nm)) %>%
+    select(Model, subclass, n, Accuracy, Predicted_Fake_Rate)
+  readr::write_csv(llm_subclass_results, file.path(tab_dir, "llm_subclass_results.csv"))
+
+  # Parse-reliability summary (one row per model x regime)
+  purrr::imap_dfr(llm_pred_list, function(d, nm) tibble(
+    Model = nm, auto_parse_fail_pct = round(100 * mean(!d$auto_ok), 3),
+    unresolved_after_review = sum(!d$resolved))) %>%
+    readr::write_csv(file.path(tab_dir, "llm_parse_reliability.csv"))
+
+  print(knitr::kable(llm_metrics, digits = 3))
+
+  ggplot2::ggsave(file.path(fig_dir, "plot_llm_accuracy_by_subclass.png"),
+    ggplot(llm_subclass_results, aes(subclass, Accuracy, fill = Model)) +
+      geom_col(position = position_dodge(width = 0.8), width = 0.75) + ylim(0, 1) +
+      labs(title = "LLM accuracy by subclass (zero-shot vs 8-shot)",
+           x = "Subclass", y = "Accuracy") + theme_minimal(),
+    width = 9, height = 5.5, dpi = 300)
+  ggplot2::ggsave(file.path(fig_dir, "plot_llm_predicted_fake_rate.png"),
+    ggplot(llm_subclass_results, aes(subclass, Predicted_Fake_Rate, fill = Model)) +
+      geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+      geom_hline(yintercept = 0.5, linetype = "dashed") + ylim(0, 1) +
+      labs(title = "LLM predicted-fake rate by subclass (detector bias)",
+           x = "Subclass", y = "Predicted fake rate") + theme_minimal(),
+    width = 9, height = 5.5, dpi = 300)
+
+  # Per-model confusion matrices (counts)
+  for (nm in names(llm_pred_list)) {
+    cm <- caret::confusionMatrix(llm_pred_list[[nm]]$pred, llm_pred_list[[nm]]$truth,
+                                 positive = "fake", mode = "everything")
+    safe <- gsub("[^A-Za-z0-9]+", "_", nm)
+    as.data.frame.matrix(cm$table) %>% tibble::rownames_to_column("prediction\\reference") %>%
+      readr::write_csv(file.path(tab_dir, paste0("confusion_", safe, ".csv")))
+  }
+} else {
+  message("[04] No LLM predictions found in ", art_dir, " — run the 04a_llm_infer_*.qmd files first.")
+}
+```
+
+## Does the 8-shot set help? McNemar per model
+
+```{r llm-mcnemar}
+#| message: true
+#| warning: false
+
+mcnemar_rows <- list()
+for (k in llm_keys) {
+  dz   <- llm_pred_list[[pretty_name(k, "zero")]]
+  dfew <- llm_pred_list[[pretty_name(k, "few")]]
+  if (is.null(dz) || is.null(dfew)) next
+  paired <- inner_join(dz %>% transmute(doc_id, truth, zero = pred),
+                       dfew %>% transmute(doc_id, few = pred), by = "doc_id") %>%
+    mutate(zero_correct = zero == truth, few_correct = few == truth)
+  mt <- stats::mcnemar.test(table(paired$zero_correct, paired$few_correct))
+  cat(sprintf("%-18s zero=%.3f  8-shot=%.3f  McNemar p=%.4g\n",
+              model_labels[[k]], mean(paired$zero_correct), mean(paired$few_correct), mt$p.value))
+  mcnemar_rows[[k]] <- tibble(Model = model_labels[[k]],
+    Zero_Acc = mean(paired$zero_correct), FewShot_Acc = mean(paired$few_correct),
+    Delta = mean(paired$few_correct) - mean(paired$zero_correct), McNemar_p = mt$p.value)
+}
+if (length(mcnemar_rows) > 0) {
+  llm_fewshot_lift <- bind_rows(mcnemar_rows)
+  readr::write_csv(llm_fewshot_lift, file.path(tab_dir, "llm_fewshot_lift.csv"))
+  print(knitr::kable(llm_fewshot_lift, digits = 4))
+}
+```
+
+## Full comparison across every detector
+
+```{r full-comparison}
+#| message: true
+#| warning: false
+
+# Read the all-detector table 03 wrote (traditional ML + BERT) and append the LLMs.
+amm <- file.path(tab_dir, "all_model_metrics.csv")
+asr <- file.path(tab_dir, "all_subclass_results.csv")
+base_metrics  <- if (file.exists(amm)) readr::read_csv(amm, show_col_types = FALSE) else NULL
+base_subclass <- if (file.exists(asr)) readr::read_csv(asr, show_col_types = FALSE) else NULL
+if (is.null(base_metrics))
+  message("[04] all_model_metrics.csv not found — run 02 then 03 first for the full comparison.")
+
+full_metrics <- bind_rows(base_metrics, if (exists("llm_metrics")) llm_metrics)
+readr::write_csv(full_metrics, file.path(tab_dir, "full_metrics.csv"))
+print(knitr::kable(full_metrics, digits = 3))
+
+full_subclass <- bind_rows(
+  if (!is.null(base_subclass)) base_subclass %>% select(Model, subclass, n, Accuracy),
+  if (exists("llm_subclass_results")) llm_subclass_results %>% select(Model, subclass, n, Accuracy)
+)
+readr::write_csv(full_subclass, file.path(tab_dir, "full_subclass.csv"))
+
+ggplot2::ggsave(file.path(fig_dir, "plot_all_detectors_subclass_accuracy.png"),
+  ggplot(full_subclass, aes(subclass, Accuracy, fill = Model)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.75) + ylim(0, 1) +
+    labs(title = "Subclass accuracy by detector", x = "Subclass", y = "Accuracy") +
+    theme_minimal(),
+  width = 11, height = 5.5, dpi = 300)
+```

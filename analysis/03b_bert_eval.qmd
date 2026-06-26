@@ -1,0 +1,407 @@
+---
+title: "03b_bert_eval"
+format: html
+editor: visual
+---
+
+```{r setup}
+#| message: false
+#| warning: false
+
+# ── Standalone setup ──────────────────────────────────────────────────────────
+# This notebook builds the BERT input CSV for the Colab fine-tuning run
+# AND evaluates BERT from the committed predictions below. The
+# shared modelling table is OPTIONAL — it is only needed to (re)build that input
+# and for the test-set cross-check; the committed predictions are evaluated
+# without it (no GPU, no dataset).
+library(tidyverse)
+art_dir <- "../artifacts"
+
+model_data_path <- file.path(art_dir, "gossip_model_data.csv")
+if (file.exists(model_data_path)) {
+  model_data <- readr::read_csv(model_data_path, show_col_types = FALSE) %>%
+    mutate(
+      subclass = factor(subclass, levels = c("HF", "MF", "HR", "MR")),
+      label    = factor(label,    levels = c("fake", "real")),
+      split    = factor(split,    levels = c("train", "validation", "test"))
+    )
+  test_df <- model_data %>% filter(split == "test")
+}
+```
+
+# Fine-tuned BERT
+
+## What this section does
+
+A fine-tuned `bert-base-uncased` is the third detector. R owns the **data and the evaluation** (so the comparison stays fair and the metrics are computed exactly as for the other models); Python owns the **fine-tuning** (so it can run on a free GPU). The two hand off via CSV.
+
+Pipeline: **R** writes the modelling CSV from the shared split → **Python on a GPU** tokenises, fine-tunes, and scores the test split → **R** evaluates from those frozen predictions with the same helpers as `02`/`04`, runs the truncation sensitivity check, and folds BERT into the comparison.
+
+BERT reuses the shared `model_data` split unchanged (same `doc_text`, same 60/20/20), so it scores the identical 2,796 test rows as every other model; it additionally uses the `validation` split to select the best checkpoint on macro-F1. Inputs are truncated to 512 tokens. The hyper-parameter recipe lives in the fine-tuning chunk below and in the companion GPU script.
+
+> **How to run.** The first chunk is an ordinary R chunk — run it locally; it writes `gossip_bert_data.csv`. The Python chunks are `eval: false` so rendering never fine-tunes on CPU: run the identical code on a GPU via the companion script (upload the CSV to Colab with a GPU runtime, run, then download `bert_test_predictions.csv` and `bert_training_log.csv` into `../artifacts/`). The evaluation chunks are guarded by `file.exists()`, so the document renders before the predictions are back and populates once they are.
+
+## BERT modelling data from the shared table (R)
+
+We take `bert_data` directly from the shared `model_data` table: the document text and the split label for every one of the 13,984 balanced/deduplicated articles. Because every model draws from this same table, the partition and the text are identical across methods by construction — no separate integrity check against an external split file is needed. The chunk then reports the composition and cross-checks that BERT's test rows equal the shared `test_df`. It works whether `model_data` was just built in memory (full render) or loaded from `gossip_model_data.csv` (standalone session).
+
+```{r bert-build-data}
+#| message: true
+#| warning: false
+
+# ── BERT modelling data — only needed to (re)build the GPU input ────
+# This chunk writes the CSV that 03a_bert_finetune_gpu.py consumes. It is skipped
+# automatically when the shared table is absent (e.g. a grader reproducing the
+# BERT *evaluation* from the committed predictions, with no dataset downloaded).
+if (exists("model_data")) {
+  bert_data <- model_data %>% select(doc_id, label, subclass, split, doc_text)
+  stopifnot(!any(is.na(bert_data$doc_text)), !any(bert_data$doc_text == ""))
+  stopifnot(!any(duplicated(bert_data$doc_id)))
+
+  # Cross-check: BERT's test rows == the shared test set (must be identical)
+  if (exists("test_df")) {
+    stopifnot(setequal(bert_data$doc_id[bert_data$split == "test"], test_df$doc_id))
+    cat("BERT test set == shared test set (", nrow(test_df), "rows).\n")
+  }
+
+  bert_data_path <- file.path(art_dir, "gossip_bert_data.csv")
+  readr::write_csv(bert_data, bert_data_path)
+  cat("Wrote", bert_data_path, "\n")
+  cat("NEXT: run 03a_bert_finetune_gpu.py on a GPU, then place the two output CSVs in ", art_dir, ".\n")
+} else {
+  message("[9.1] Shared table not present -> skipping GPU-input build. ",
+          "Evaluating BERT from the committed predictions in ", art_dir, ".")
+}
+```
+
+## Python environment (Transformers + Torch)
+
+> **`eval: false` — run on a GPU, not while rendering.** The two chunks below are the exact code in `03a_bert_finetune_gpu.py`. On Colab/Kaggle, `torch` is already present, so usually only the first three packages need installing:
+>
+> ``` bash
+> pip install "transformers>=4.44" "datasets>=2.19" "accelerate>=0.30" \
+>             scikit-learn pandas
+> ```
+
+```{python bert-setup}
+#| eval: false
+
+# ── Imports, determinism, device ────────────────────────────────────
+import os, random, inspect
+import numpy as np
+import pandas as pd
+import torch
+
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    DataCollatorWithPadding,
+    set_seed,
+)
+from transformers.utils import logging as hf_logging
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+hf_logging.set_verbosity_error()   # quiet the benign ">512 tokens" tokenizer notes
+
+# Same seed as the rest of the thesis. NB: exact bit-for-bit reproducibility on
+# GPU is not guaranteed (cuDNN nondeterminism); results are stable to ~±0.5pt.
+SEED = 2026
+set_seed(SEED)
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+device = ("cuda" if torch.cuda.is_available()
+          else "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+          else "cpu")
+print("Torch:", torch.__version__, "| device:", device)
+if device == "cpu":
+    print("WARNING: no GPU detected — fine-tuning will be very slow.")
+
+MODEL_NAME = "bert-base-uncased"
+MAX_LEN    = 512
+```
+
+## Load data, tokenise, build datasets (Python)
+
+We read the modelling CSV, map labels to integers (`fake` → 1 so that the model's class-1 probability is directly `prob_fake`, keeping "fake" as the positive class exactly as in the traditional models), and tokenise with truncation to 512 tokens. We also record each document's *untruncated* token length so the truncation sensitivity analysis can separate articles that fit within 512 tokens from those that were truncated.
+
+```{python bert-data}
+#| eval: false
+
+# ── Load the shared data, tokenise, build HF datasets ───────────────
+label2id = {"real": 0, "fake": 1}
+id2label = {0: "real", 1: "fake"}
+
+df = pd.read_csv("gossip_bert_data.csv")
+df = df.dropna(subset=["doc_text"]).copy()
+df = df[df["doc_text"].astype(str).str.strip() != ""].copy()
+df["labels"] = df["label"].map(label2id).astype(int)
+
+df_train = df[df["split"] == "train"].reset_index(drop=True)
+df_val   = df[df["split"] == "validation"].reset_index(drop=True)
+df_test  = df[df["split"] == "test"].reset_index(drop=True)
+print(f"train={len(df_train)}  val={len(df_val)}  test={len(df_test)}")
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+def tokenize_fn(batch):
+    return tokenizer(batch["doc_text"], truncation=True, max_length=MAX_LEN)
+
+def to_dataset(frame):
+    return (
+        Dataset.from_pandas(frame[["doc_text", "labels"]], preserve_index=False)
+        .map(tokenize_fn, batched=True, remove_columns=["doc_text"])
+    )
+
+train_ds = to_dataset(df_train)
+val_ds   = to_dataset(df_val)
+test_ds  = to_dataset(df_test)
+
+# Untruncated token length (incl. [CLS]/[SEP]) -> truncation flag for the truncation sensitivity analysis
+def token_lengths(texts):
+    return [len(tokenizer(t, truncation=False)["input_ids"]) for t in texts]
+
+df_test["n_tokens"]  = token_lengths(df_test["doc_text"].tolist())
+df_test["truncated"] = df_test["n_tokens"] > MAX_LEN
+
+# Descriptive: how much information loss does the 512-token cap cause per split?
+for name, frame in [("train", df_train), ("val", df_val), ("test", df_test)]:
+    lens = (df_test["n_tokens"].to_numpy() if name == "test"
+            else np.asarray(token_lengths(frame["doc_text"].tolist())))
+    print(f"{name:5s}: median tokens={int(np.median(lens))}, "
+          f">512 = {(lens > MAX_LEN).mean():.1%}")
+```
+
+## Fine-tune `bert-base-uncased` (Python)
+
+The `Trainer` evaluates on the validation split at the end of every epoch, tracks macro-F1, and reloads the best checkpoint at the end (`load_best_model_at_end=True`, `metric_for_best_model="f1_macro"`). After training we score the held-out test split once and write the predictions, the per-document token length, and the truncation flag to `bert_test_predictions.csv`; we also dump the per-epoch validation log to `bert_training_log.csv` for the training-dynamics plot below. The `inspect`-based shims keep this working across Transformers versions (`eval_strategy`/`evaluation_strategy` and `processing_class`/`tokenizer`).
+
+```{python bert-finetune}
+#| eval: false
+
+# ── Fine-tune, then predict on the held-out test split ──────────────
+model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME, num_labels=2, id2label=id2label, label2id=label2id
+)
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = logits.argmax(axis=-1)
+    return {
+        "accuracy":       accuracy_score(labels, preds),
+        "f1_macro":       f1_score(labels, preds, average="macro"),
+        "f1_fake":        f1_score(labels, preds, pos_label=1, average="binary"),
+        "precision_fake": precision_score(labels, preds, pos_label=1, zero_division=0),
+        "recall_fake":    recall_score(labels, preds, pos_label=1, zero_division=0),
+    }
+
+# Version-robust strategy key ("eval_strategy" in newer Transformers, else
+# "evaluation_strategy"). load_best_model_at_end needs eval == save strategy.
+_ta_params = inspect.signature(TrainingArguments.__init__).parameters
+_eval_key  = "eval_strategy" if "eval_strategy" in _ta_params else "evaluation_strategy"
+
+args_kwargs = dict(
+    output_dir="bert_gossipcop_ckpt",
+    num_train_epochs=3,                 # proposal recipe (Devlin et al., 2019)
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=32,
+    learning_rate=2e-5,
+    warmup_ratio=0.1,                   # linear warmup over first 10% of steps
+    weight_decay=0.01,
+    logging_steps=50,
+    save_total_limit=2,
+    load_best_model_at_end=True,
+    metric_for_best_model="f1_macro",   # checkpoint selected on validation macro-F1
+    greater_is_better=True,
+    seed=SEED,
+    fp16=torch.cuda.is_available(),     # mixed precision on GPU for speed
+    report_to="none",
+)
+args_kwargs[_eval_key]       = "epoch"
+args_kwargs["save_strategy"] = "epoch"
+training_args = TrainingArguments(**args_kwargs)
+
+# Version-robust tokenizer kwarg ("processing_class" in newer Transformers).
+trainer_kwargs = dict(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
+    data_collator=DataCollatorWithPadding(tokenizer),
+    compute_metrics=compute_metrics,
+)
+_tr_params = inspect.signature(Trainer.__init__).parameters
+if "processing_class" in _tr_params:
+    trainer_kwargs["processing_class"] = tokenizer
+else:
+    trainer_kwargs["tokenizer"] = tokenizer
+trainer = Trainer(**trainer_kwargs)
+
+trainer.train()
+print("Best validation f1_macro:", trainer.state.best_metric)
+
+# ── Score the held-out test split (order preserved == df_test order) ──────────
+def softmax_np(x):
+    x = x - x.max(axis=1, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=1, keepdims=True)
+
+pred_out  = trainer.predict(test_ds)
+logits    = pred_out.predictions
+prob_fake = softmax_np(logits)[:, label2id["fake"]]
+pred_id   = logits.argmax(axis=1)
+assert len(pred_id) == len(df_test)      # positional alignment guard
+
+predictions = pd.DataFrame({
+    "doc_id":    df_test["doc_id"].values,
+    "subclass":  df_test["subclass"].values,
+    "truth":     df_test["label"].values,                 # "fake"/"real"
+    "pred":      [id2label[i] for i in pred_id],
+    "prob_fake": prob_fake,
+    "n_tokens":  df_test["n_tokens"].values,
+    "truncated": df_test["truncated"].values,
+})
+predictions.to_csv("bert_test_predictions.csv", index=False)
+
+pd.DataFrame(trainer.state.log_history).to_csv("bert_training_log.csv", index=False)
+print("Wrote bert_test_predictions.csv and bert_training_log.csv")
+```
+
+
+## Evaluation (from the frozen BERT predictions)
+
+BERT is scored from the committed `bert_test_predictions.csv` (and
+`bert_training_log.csv`) — **no GPU, no dataset** — with the same helpers `02` and
+`04` use. It then reads the traditional-ML comparison tables `02` wrote and folds
+BERT into the all-detector comparison.
+
+```{r bert-eval-helpers}
+#| message: false
+#| warning: false
+library(caret)
+
+res_dir <- "../results"
+tab_dir <- file.path(res_dir, "tables")
+fig_dir <- file.path(res_dir, "figures")
+dir.create(tab_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+extract_binary_metrics <- function(cm, model_name) {
+  tibble(
+    Model               = model_name,
+    Accuracy            = as.numeric(cm$overall["Accuracy"]),
+    Precision           = as.numeric(cm$byClass["Precision"]),
+    Recall              = as.numeric(cm$byClass["Recall"]),
+    F1                  = as.numeric(cm$byClass["F1"]),
+    Specificity         = as.numeric(cm$byClass["Specificity"]),
+    `Balanced Accuracy` = as.numeric(cm$byClass["Balanced Accuracy"])
+  )
+}
+evaluate_global <- function(pred, truth, model_name) {
+  cm <- caret::confusionMatrix(factor(pred,  c("real", "fake")),
+                               factor(truth, c("real", "fake")),
+                               positive = "fake", mode = "everything")
+  extract_binary_metrics(cm, model_name)
+}
+subclass_breakdown <- function(truth, pred, prob_fake, subclass) {
+  tibble(subclass = subclass, truth = truth, pred = pred, prob_fake = prob_fake) %>%
+    group_by(subclass) %>%
+    summarise(n = n(), Accuracy = mean(pred == truth),
+              Predicted_Fake_Rate = mean(pred == "fake"),
+              Mean_Prob_Fake = mean(prob_fake), .groups = "drop")
+}
+save_fig <- function(p, name, w = 8, h = 5) {
+  ggplot2::ggsave(file.path(fig_dir, paste0(name, ".png")), p, width = w, height = h, dpi = 300)
+  ggplot2::ggsave(file.path(fig_dir, paste0(name, ".pdf")), p, width = w, height = h)
+}
+
+bert_pred_file <- file.path(art_dir, "bert_test_predictions.csv")
+have_bert <- file.exists(bert_pred_file)
+if (!have_bert) message("[BERT] ", bert_pred_file, " not found — run the Colab script first.")
+```
+
+```{r bert-global-subclass}
+#| message: true
+#| warning: false
+if (have_bert) {
+  bert_pred_df <- readr::read_csv(bert_pred_file, show_col_types = FALSE) %>%
+    mutate(truth = factor(truth, c("real", "fake")), pred = factor(pred, c("real", "fake")),
+           subclass = factor(subclass, c("HF", "MF", "HR", "MR")))
+  if (exists("test_df")) stopifnot(setequal(bert_pred_df$doc_id, test_df$doc_id))
+
+  bert_metrics     <- evaluate_global(bert_pred_df$pred, bert_pred_df$truth, "BERT (fine-tuned)")
+  bert_by_subclass <- subclass_breakdown(bert_pred_df$truth, bert_pred_df$pred,
+                                         bert_pred_df$prob_fake, bert_pred_df$subclass) %>%
+    mutate(Model = "BERT (fine-tuned)")
+  readr::write_csv(bert_metrics, file.path(tab_dir, "bert_metrics.csv"))
+  readr::write_csv(bert_by_subclass %>% select(subclass, n, Accuracy, Predicted_Fake_Rate, Mean_Prob_Fake),
+                   file.path(tab_dir, "bert_by_subclass.csv"))
+  save_fig(ggplot(bert_by_subclass, aes(subclass, Accuracy)) + geom_col() + ylim(0, 1) +
+             labs(title = "Fine-tuned BERT: Accuracy by Subclass", x = "Subclass", y = "Accuracy") +
+             theme_minimal(), "bert_subclass_accuracy")
+  print(knitr::kable(bert_metrics, digits = 3))
+}
+```
+
+```{r bert-truncation}
+#| message: true
+#| warning: false
+if (have_bert && "truncated" %in% names(bert_pred_df)) {
+  group_binary_metrics <- function(df) {
+    cm <- caret::confusionMatrix(factor(df$pred, c("real", "fake")), factor(df$truth, c("real", "fake")),
+                                 positive = "fake", mode = "everything")
+    tibble(n = nrow(df), Accuracy = as.numeric(cm$overall["Accuracy"]),
+           Precision = as.numeric(cm$byClass["Precision"]), Recall = as.numeric(cm$byClass["Recall"]),
+           F1 = as.numeric(cm$byClass["F1"]), Balanced_Accuracy = as.numeric(cm$byClass["Balanced Accuracy"]))
+  }
+  trunc_sensitivity <- bert_pred_df %>%
+    mutate(group = if_else(truncated, "Truncated (>512 tokens)", "Full (<=512 tokens)")) %>%
+    group_by(group) %>% group_modify(~ group_binary_metrics(.x)) %>% ungroup()
+  readr::write_csv(trunc_sensitivity, file.path(tab_dir, "trunc_sensitivity.csv"))
+  print(knitr::kable(trunc_sensitivity, digits = 3))
+}
+```
+
+```{r bert-training-curve}
+#| message: true
+#| warning: false
+bert_log_file <- file.path(art_dir, "bert_training_log.csv")
+if (file.exists(bert_log_file)) {
+  bert_eval_log <- readr::read_csv(bert_log_file, show_col_types = FALSE) %>%
+    filter(!is.na(eval_f1_macro)) %>% select(epoch, eval_loss, eval_accuracy, eval_f1_macro)
+  readr::write_csv(bert_eval_log, file.path(tab_dir, "bert_eval_log.csv"))
+  save_fig(ggplot(bert_eval_log, aes(epoch, eval_f1_macro)) + geom_line() + geom_point() +
+             labs(title = "Fine-tuned BERT: validation macro-F1 by epoch",
+                  x = "Epoch", y = "Validation macro-F1") + theme_minimal(),
+           "bert_training_curve", w = 7)
+  print(knitr::kable(bert_eval_log, digits = 4))
+}
+```
+
+```{r bert-comparison}
+#| message: true
+#| warning: false
+# Fold BERT into the all-detector comparison: read the traditional-ML tables that
+# 02 wrote, append the BERT row, and persist for 04 to extend with the LLMs.
+tm  <- file.path(tab_dir, "traditional_metrics.csv")
+tsr <- file.path(tab_dir, "traditional_subclass_results.csv")
+if (have_bert && file.exists(tm) && file.exists(tsr)) {
+  traditional_metrics          <- readr::read_csv(tm,  show_col_types = FALSE)
+  traditional_subclass_results <- readr::read_csv(tsr, show_col_types = FALSE)
+
+  all_model_metrics <- bind_rows(traditional_metrics, bert_metrics)
+  all_subclass_results <- bind_rows(
+    traditional_subclass_results,
+    bert_by_subclass %>% select(Model, subclass, n, Accuracy, Predicted_Fake_Rate, Mean_Prob_Fake)
+  )
+  readr::write_csv(all_model_metrics,    file.path(tab_dir, "all_model_metrics.csv"))
+  readr::write_csv(all_subclass_results, file.path(tab_dir, "all_subclass_results.csv"))
+  print(knitr::kable(all_model_metrics, digits = 3))
+} else if (have_bert) {
+  message("[BERT 9.9] traditional_metrics not found — run 02 first to enable the comparison.")
+}
+```

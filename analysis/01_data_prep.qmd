@@ -1,0 +1,442 @@
+---
+title: "01_data_prep"
+format: html
+editor: visual
+---
+
+# Libraries
+
+```{r my-libraries}
+# ── Environment setup ──────────────────────────────────────────
+
+# Packages used across the whole Traditional ML workflow
+pkgs <- c(
+  "tidyverse",    # data wrangling
+  "jsonlite",     # read the HF / HR / MF / MR JSON files
+  "quanteda",     # tokenisation, document-feature matrix, TF-IDF
+  "caret",        # confusionMatrix + partitioning (as in the course notebooks)
+  "e1071",        # naiveBayes (as in the course notebooks)
+  "quanteda.textmodels", # multinomial Naive Bayes for text (textmodel_nb)
+  "randomForest"  # random forest
+)
+
+# Install any that are missing, then load them all
+missing <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(missing) > 0) install.packages(missing)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Reproducibility (same seed convention as your course notebooks).
+# Note: I'll re-set this seed right before each random step
+# (balanced sampling, the split, random forest) so each is independently reproducible.
+set.seed(2026)
+
+# Sanity check
+cat("R version:", R.version.string, "\n")
+cat("Loaded:", paste(pkgs, collapse = ", "), "\n")
+```
+
+# Text-cleaning helpers
+
+Two helpers are defined once, before any modelling, and reused everywhere. `clean_scraped_text()` removes web-scraping boilerplate concentrated in the human-written subclasses (photo credits, gallery/video labels, newsletter widgets); `build_doc_text()` assembles `title + cleaned body`. Defining them here — independent of the modelling code — means the classical models, BERT, and the LLMs all build byte-identical document text.
+
+```{r my-text-helpers}
+# ── Web-scraping artifact cleaner ─────────────────────────────────────────────
+# Human-written subclasses (HF, HR) were scraped from live news websites and
+# contain several categories of noise that would otherwise leak source-level
+# signals into the models. Machine-generated subclasses (MF, MR) are clean.
+#
+# Artifact families removed (all concentrated in HF/HR):
+#   1. Newsletter signup widget + Handlebars verifyError block  (~34 rows)
+#      The Independent's frontend template rendered {{ #verifyErrors }},
+#      {{ message }}, {{ ^verifyErrors }} etc. into scraped body text.
+#   2. Photo credit attribution strings embedded in gallery captions (~571 rows)
+#      "AFP via Getty", "Getty Images", "PA Wire", "REUTERS", "AP Photo" etc.
+#   3. Image gallery navigation UI  ("Show all 55 1 / 55")              (~17 rows)
+#   4. Inline media labels  ("VIDEO:", "GALLERY:")                      (~276 rows)
+#   5. Close-button artefact  ("✕ Close")                               (~1 row)
+#
+# Risk: without this cleaning, photo credit strings and VIDEO:/GALLERY: labels
+# are near-absent from machine-generated text (MF/MR), so any model — including
+# BERT — could exploit source-scraping patterns instead of veracity signals.
+clean_scraped_text <- function(x) {
+  # 1. Newsletter / verifyError block: anchor on "Please enter a valid email"
+  #    and consume through "Something went wrong. Please try again later"
+  #    and its closing {{ /verifyErrors }} tag.
+  x <- gsub(
+    "Please enter a valid email address[\\s\\S]*?Something went wrong\\.\\s*Please try again later\\s*\\{\\{ /verifyErrors \\}\\}",
+    " ", x, perl = TRUE
+  )
+  # 2. Catch-all for any remaining Handlebars / Mustache tokens
+  x <- gsub("\\{\\{[^}]*\\}\\}", " ", x, perl = TRUE)
+  # 3. Photo credit attribution strings.
+  #    Covers the common forms:  "AFP via Getty Images", "Getty Images",
+  #    "REUTERS", "AP Photo", named-photographer credits ("JIM WATSON/AFP/GettyImages"),
+  #    and outlet-specific credits ("SussexRoyal/PA", "Chris Jackson/Getty").
+  x <- gsub(
+    paste0(
+      "\\b[A-Z][A-Z ]+/AFP/Getty(?:Images|(?:\\s+Images)?)\\b|",  # e.g. JIM WATSON/AFP/GettyImages
+      "\\bAFP via Getty(?: Images)?\\b|",
+      "\\bAFP/Getty(?:Images|(?:\\s+Images)?)\\b|",
+      "(?<![a-zA-Z])Getty(?:Images|(?:\\s+Images)?)|",                  # Getty Images / GettyImages (lookbehind: not preceded by a letter)
+      "\\bPA Wire\\b|\\bREUTERS\\b|\\bAP Photo\\b|",
+      "\\bSussexRoyal/PA\\b|",
+      "\\bChris Jackson/Getty\\b|",
+      "\\bInvictus Games Foundation/Getty\\b"
+    ),
+    " ", x, perl = TRUE
+  )
+  # 4. Image gallery navigation UI  ("Show all 55 1 / 55")
+  x <- gsub("\\bShow all \\d+\\s+\\d+\\s*/\\s*\\d+", " ", x, perl = TRUE)
+  # 5. Inline media labels
+  x <- gsub("\\b(?:VIDEO|GALLERY):\\s*", " ", x, perl = TRUE, ignore.case = TRUE)
+  # 6. Close-button artefact ("✕ Close")
+  x <- gsub("✕\\s*Close\\s*", " ", x)
+  x
+}
+
+# Shared document-text builder: the document is title + body, whitespace-squished.
+# (We deliberately do NOT include `description`: it is often a duplicate/summary
+#  of the body and would overweight repeated information.)
+build_doc_text <- function(title, text) {
+  str_squish(paste(coalesce(title, ""), clean_scraped_text(coalesce(text, ""))))
+}
+```
+
+# Data Prep
+
+## Loading data
+
+```{r my-data}
+# ── Load the four GossipCop++ files + attach labels ────────────
+
+# Point this at your local GossipCop++ folder.
+# If your files have NO .json extension, drop the paste0(..., ".json") in load_subclass().
+data_dir <- "data/GossipCop++"
+
+# (file stem, four-way subclass, binary label)
+subclass_spec <- tribble(
+  ~file, ~subclass, ~label,
+  "HF",  "HF",      "fake",   # human-written fake
+  "MF",  "MF",      "fake",   # machine-generated fake
+  "HR",  "HR",      "real",   # human-written real
+  "MR",  "MR",      "real"    # machine-generated real
+)
+
+load_subclass <- function(file, subclass, label, dir = data_dir) {
+  path <- file.path(dir, paste0(file, ".json"))
+  if (!file.exists(path)) {
+    stop("File not found: ", path,
+         "\n  -> check `data_dir`, or remove the '.json' if your files have no extension.")
+  }
+  raw <- jsonlite::fromJSON(path, simplifyVector = FALSE) # named list, one entry per article
+  dplyr::bind_rows(raw) %>%                               # -> one row per article
+    dplyr::mutate(subclass = subclass, label = label)
+}
+
+# Load and stack all four (HR is ~29 MB, so this may take a few seconds)
+gossip_raw <- subclass_spec %>%
+  pmap(load_subclass) %>%
+  bind_rows() %>%
+  mutate(
+    subclass = factor(subclass, levels = c("HF", "MF", "HR", "MR")),
+    label    = factor(label,    levels = c("fake", "real")) # "fake" is the positive class for later
+  )
+
+# ── Inspect ────────────────────────────────────────────────────────────
+glimpse(gossip_raw)
+
+# Counts per subclass — should match the README distribution
+gossip_raw %>% count(subclass)
+```
+
+## Balancing dataset
+
+This is the distribution of the dataset for every subclass:
+
+| Dataset   | Human Fake | Machine Fake | Human Real | Machine Real |
+|:----------|-----------:|-------------:|-----------:|-------------:|
+| GossipCop |       4084 |         4084 |       8168 |         4169 |
+
+We have more Human Real news than the rest but following the methodology of the paper, we balance the number of HR, HF, MR, MF to be equal. In this way, we can measure the performance of our models under these different scenarios.
+
+```{r my-duplication-diagnostic}
+# ── Diagnostic only: why we must dedup BEFORE sampling ─────────
+# This chunk produces NO object used downstream. Its only job is to show the
+# duplication problem on the FULL raw pool, so the numbers match exactly what
+# the cleaning (next chunk) removes. The actual balanced sample is built later,
+# AFTER deduplication.
+
+# ids vs rows: the dataset reuses one source id for a story and its
+# machine-generated counterpart, so ids repeat ACROSS subclasses but should be
+# unique WITHIN each subclass.
+gossip_raw %>%
+  summarise(
+    rows         = n(),
+    unique_ids   = n_distinct(id),
+    unique_texts = n_distinct(text),
+    empty_text   = sum(is.na(text) | text == "")
+  )
+
+# Exact-duplicate article bodies WITHIN a subclass (re-scraped stories).
+# These are the rows that, if left in, could straddle train/test after the split.
+gossip_raw %>%
+  group_by(subclass) %>%
+  summarise(
+    dup_id_within   = sum(duplicated(id)),    # expect 0 in each subclass
+    dup_text_within = sum(duplicated(text)),  # the within-subclass body dupes
+    .groups = "drop"
+  )
+
+# Same body appearing in MORE THAN ONE subclass = an ambiguous label
+# (identical text tagged two different ways). These get dropped entirely.
+n_ambiguous <- gossip_raw %>%
+  distinct(subclass, text) %>%
+  count(text) %>%
+  filter(n > 1) %>%
+  nrow()
+cat("Texts appearing in >1 subclass (ambiguous label):", n_ambiguous, "\n")
+```
+
+- **ids repeat across subclasses, not within them.** `unique_ids` is below `rows` because the dataset reuses the same source id for an article and its machine-generated counterpart (HF↔MF, HR↔MR). Within a single subclass `dup_id_within` is 0, so the id reuse is expected, not a problem — we just need a key that is unique per row, which we build when splitting the data (`doc_id = subclass_id`).
+
+- **The real issue is exact-duplicate article bodies inside subclasses** (`dup_text_within`). Same text, different id — likely re-scraped stories. If these survive into the split, identical articles can land in both train and test and the models memorize rather than generalize.
+
+- **A handful of bodies also appear in more than one subclass** (`n_ambiguous`): the same text labelled two different ways. We drop all of their rows, because they cannot be assigned a single ground-truth label.
+
+## Artifact prevalence by subclass
+
+Before cleaning, we confirm that web-scraping artifacts are asymmetrically concentrated in the **human-written** subclasses (HF, HR) and negligible in the **machine-generated** ones (MF, MR). This asymmetry would otherwise create a spurious source-type signal: any model trained on uncleaned text could partly learn "articles with AFP/Getty credits or `VIDEO:` labels → human-written" rather than genuine veracity cues. The table below motivates the `clean_scraped_text()` helper defined above.
+
+```{r my-artifact-diagnostic}
+# ── Artifact-prevalence diagnostic: human vs machine subclasses ────────────
+# Produces a summary table only (no downstream objects).
+# Patterns mirror clean_scraped_text() so the table shows exactly what
+# that function removes and which subclasses carry the burden.
+
+artifact_flags <- function(txt) {
+  tibble(
+    photo_credit    = str_detect(txt, regex(
+                        "AFP via Getty|AFP/Getty|(?<![a-zA-Z])Getty(?:Images|\\s+Images?)|PA Wire|REUTERS|AP Photo"
+                      )),
+    video_label     = str_detect(txt, regex("\\bVIDEO:\\s*",   ignore_case = TRUE)),
+    gallery_label   = str_detect(txt, regex("\\bGALLERY:\\s*", ignore_case = TRUE)),
+    template_tokens = str_detect(txt, fixed("{{ ")),
+    newsletter_ui   = str_detect(txt, fixed("Please enter a valid email address"))
+  )
+}
+
+artifact_by_subclass <- gossip_raw %>%
+  mutate(txt = coalesce(text, "")) %>%
+  bind_cols(artifact_flags(coalesce(gossip_raw$text, ""))) %>%
+  group_by(subclass) %>%
+  summarise(
+    n               = n(),
+    photo_credit_pct    = round(100 * mean(photo_credit),    1),
+    video_label_pct     = round(100 * mean(video_label),     1),
+    gallery_label_pct   = round(100 * mean(gallery_label),   1),
+    template_tokens_pct = round(100 * mean(template_tokens), 1),
+    newsletter_ui_pct   = round(100 * mean(newsletter_ui),   1),
+    any_artifact_pct    = round(100 * mean(photo_credit | video_label |
+                                           gallery_label | template_tokens |
+                                           newsletter_ui),   1),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  artifact_by_subclass,
+  caption = "% of rows containing each web-scraping artifact, by subclass (pre-cleaning)",
+  col.names = c("Subclass", "n", "Photo credit", "VIDEO:", "GALLERY:",
+                "{{ }} tokens", "Newsletter UI", "Any artifact")
+)
+```
+
+```{r my-artifact-plot}
+# Bar chart: % rows with any artifact, human vs machine
+artifact_by_subclass %>%
+  mutate(source_type = if_else(subclass %in% c("HF", "HR"), "Human-written", "Machine-generated")) %>%
+  ggplot(aes(x = subclass, y = any_artifact_pct, fill = source_type)) +
+  geom_col(width = 0.6) +
+  scale_fill_manual(values = c("Human-written" = "#E07B54", "Machine-generated" = "#5B8DB8")) +
+  labs(
+    title = "Web-scraping artifact prevalence by subclass (pre-cleaning)",
+    subtitle = "Artifacts are concentrated in human-written subclasses (HF, HR)\nand near-absent from machine-generated ones (MF, MR)",
+    x = "Subclass", y = "% rows with ≥1 artifact",
+    fill = "Source type"
+  ) +
+  theme_minimal()
+```
+
+## Cleaning the data
+
+```{r my-cleaning}
+# ── Dedupe, then balanced 1:1:1:1 sample ─────────────
+
+# Texts that appear in >1 subclass = ambiguous label -> drop all their rows
+ambiguous_texts <- gossip_raw %>%
+  distinct(subclass, text) %>%   # one row per (subclass, text)
+  count(text) %>%
+  filter(n > 1) %>%
+  pull(text)
+cat("Cross-subclass (ambiguous) texts dropped:", length(ambiguous_texts), "\n")
+
+gossip_dedup <- gossip_raw %>%
+  filter(!is.na(text), text != "") %>%     # drop empties (none expected)
+  filter(!text %in% ambiguous_texts) %>%   # drop label-conflicting texts
+  distinct(text, .keep_all = TRUE)         # drop within-subclass exact dupes
+
+cat("Rows after dedup:", nrow(gossip_dedup),
+    "(removed", nrow(gossip_raw) - nrow(gossip_dedup), "rows)\n")
+gossip_dedup %>% count(subclass)            # deduped pool per subclass
+
+# Balanced size = smallest deduped subclass, guaranteeing exactly equal counts.
+n_per_subclass <- gossip_dedup %>% count(subclass) %>% pull(n) %>% min()
+cat("Sampling", n_per_subclass, "per subclass\n")
+
+# NOTE: this random draw is only used on the FIRST run. Once the split has been
+# saved (next section), later runs rebuild the identical sample from that
+# artifact, so the whole pipeline is deterministic even across package versions.
+set.seed(2026)   # reset right before this random step
+gossip_bal <- gossip_dedup %>%
+  group_by(subclass) %>%
+  slice_sample(n = n_per_subclass) %>%
+  ungroup()
+
+# ── Verify: balanced AND text now unique across the whole set ──────────
+gossip_bal %>% count(subclass)                                      # 4 equal groups
+gossip_bal %>% count(label) %>% mutate(prop = round(n / sum(n), 3)) # ~50/50
+gossip_bal %>% summarise(
+  rows         = n(),
+  unique_texts = n_distinct(text),
+  dup_texts    = sum(duplicated(text))    # MUST be 0 now
+)
+```
+
+## Splitting the data
+
+```{r my-split}
+# ── Stratified 60/20/20 split (stratified by subclass) ─────────
+# The split is computed ONCE and saved. On every later run we reload it, so the
+# notebook is deterministic against its own artifact and immune to dplyr/caret
+# version drift. BERT and Gemini join on the same file, so all three methods
+# score on the identical test rows.
+
+split_path <- "../artifacts/gossipcop_split_assignments.csv"   # committed: IDs+labels+split, no text
+
+if (file.exists(split_path)) {
+
+  # ── Reuse the saved partition: rebuild the exact sample from gossip_dedup ──
+  saved_split <- readr::read_csv(split_path, show_col_types = FALSE)
+
+  gossip_bal <- gossip_dedup %>%
+    mutate(doc_id = paste0(subclass, "_", id)) %>%
+    inner_join(saved_split %>% select(doc_id, split), by = "doc_id") %>%
+    mutate(
+      subclass = factor(subclass, levels = c("HF", "MF", "HR", "MR")),
+      label    = factor(label,    levels = c("fake", "real")),
+      split    = factor(split,    levels = c("train", "validation", "test"))
+    )
+
+  stopifnot(nrow(gossip_bal) == nrow(saved_split))   # artifact matches the pool
+  stopifnot(!any(is.na(gossip_bal$split)))
+  cat("Loaded saved split from", split_path, "\n")
+
+} else {
+
+  # ── First run: create the split, then persist it ──────────────────────
+  # Stable unique row id. `id` repeats across subclasses (HF<->MF, HR<->MR),
+  # so (subclass, id) is the correct unique key — reused as doc_id everywhere.
+  gossip_bal <- gossip_bal %>% mutate(doc_id = paste0(subclass, "_", id))
+  stopifnot(!any(duplicated(gossip_bal$doc_id)))
+
+  set.seed(2026)   # covers both partition calls
+
+  # Stage 1: 60% train  vs  40% holdout — stratified within each subclass
+  train_idx  <- caret::createDataPartition(gossip_bal$subclass, p = 0.60, list = FALSE)[, 1]
+  train_keys <- gossip_bal$doc_id[train_idx]
+  holdout    <- gossip_bal[-train_idx, ]
+
+  # Stage 2: split the 40% holdout 50/50 -> 20% validation + 20% test
+  val_idx   <- caret::createDataPartition(holdout$subclass, p = 0.50, list = FALSE)[, 1]
+  val_keys  <- holdout$doc_id[val_idx]
+  test_keys <- holdout$doc_id[-val_idx]
+
+  gossip_bal <- gossip_bal %>%
+    mutate(
+      split = case_when(
+        doc_id %in% train_keys ~ "train",
+        doc_id %in% val_keys   ~ "validation",
+        doc_id %in% test_keys  ~ "test"
+      ),
+      split = factor(split, levels = c("train", "validation", "test"))
+    )
+
+  readr::write_csv(
+    gossip_bal %>% select(doc_id, id, subclass, label, split),
+    split_path
+  )
+  cat("Saved split assignments ->", normalizePath(split_path), "\n")
+}
+
+stopifnot(!any(duplicated(gossip_bal$doc_id)))
+```
+
+### Verification and downloading split data
+
+```{r my-split_download}
+# ── One cached modelling table, then the named frames ─────────────────────────
+# Single source of truth for EVERY model: doc_id, subclass, label, split, doc_text.
+# `doc_text` is built ONCE here (title + body, via build_doc_text()),
+# so the TF-IDF models, BERT, and the LLMs all see byte-identical text. The table
+# is cached to CSV so a future standalone session (or the GitHub-shared copy)
+# needs only this one file — no JSON reload and no re-split.
+model_data_path <- "../artifacts/gossip_model_data.csv"   # generated (contains text) -> gitignored
+
+if (exists("gossip_bal")) {
+  # Full run: derive from the in-memory split object and refresh the cache.
+  model_data <- gossip_bal %>%
+    transmute(doc_id, subclass, label, split,
+              doc_text = build_doc_text(title, text))
+  readr::write_csv(model_data, model_data_path)
+  cat("Wrote", model_data_path, "->", normalizePath(model_data_path), "\n")
+} else {
+  # Standalone run: read the cached / GitHub CSV (the data-prep chunks above can be skipped).
+  stopifnot(file.exists(model_data_path))
+  model_data <- readr::read_csv(model_data_path, show_col_types = FALSE)
+  message("`gossip_bal` not in memory — loaded ", model_data_path, ".")
+}
+
+# Restore factor levels regardless of source. label = c("fake","real") as built;
+# the TF-IDF section re-levels to c("real","fake") so "fake" is the
+# positive class for the classical models.
+model_data <- model_data %>%
+  mutate(
+    subclass = factor(subclass, levels = c("HF", "MF", "HR", "MR")),
+    label    = factor(label,    levels = c("fake", "real")),
+    split    = factor(split,    levels = c("train", "validation", "test"))
+  )
+
+# ── Named modelling frames (one place, unambiguous sizes) ─────────────────────
+# Every model scores the SAME held-out `test_df`. Classical ML has nothing to
+# checkpoint, so it trains on the full 80% (`trainml_df`); BERT trains on the 60%
+# `train_df` and selects on the 20% `valid_df`; the LLM few-shot exemplars are
+# drawn only from the 60% `train_df`.
+test_df    <- model_data %>% filter(split == "test")                     # 20% — ALL models
+valid_df   <- model_data %>% filter(split == "validation")               # 20% — BERT checkpoint selection
+train_df   <- model_data %>% filter(split == "train")                    # 60% — BERT training + LLM exemplars
+trainml_df <- model_data %>% filter(split %in% c("train", "validation")) # 80% — classical ML
+
+# ── Verify ───────────────────────────────────────────────────────────────────
+print(model_data %>% count(split) %>% mutate(prop = round(n / sum(n), 3)))       # 0.60/0.20/0.20
+print(model_data %>% count(subclass, split) %>%                                  # 2098/699/699 each
+        pivot_wider(names_from = split, values_from = n))
+print(model_data %>% count(split, label) %>%                                     # ~50/50 in every split
+        group_by(split) %>% mutate(prop = round(n / sum(n), 3)) %>% ungroup())
+
+cat("train/test text overlap:",                                                  # MUST be 0
+    length(intersect(trainml_df$doc_text, test_df$doc_text)), "\n")
+stopifnot(nrow(test_df) == 2796)
+cat(sprintf("Frames -> train(60%%)=%d  valid(20%%)=%d  test(20%%)=%d  |  trainml(80%%)=%d\n",
+            nrow(train_df), nrow(valid_df), nrow(test_df), nrow(trainml_df)))
+```
+
+`gossip_model_data.csv` is the single artifact that makes the whole comparison fair *and* reproducible. It records, for all 13,984 deduplicated/balanced articles, the `doc_id`, `subclass`, `label`, the 60/20/20 `split`, and the `doc_text` built once via `build_doc_text()`. Every model — the classical TF-IDF models, BERT, and the LLMs — sources its rows from this one table, so they all train/score on the same partition and see byte-identical text. The four named frames make each model's allocation explicit: the **20% `test_df` is identical for every method**; BERT trains on the 60% `train_df` and selects checkpoints on the 20% `valid_df`; the classical models, having nothing to checkpoint, fold validation back in and train on the full 80% `trainml_df`; and the LLM few-shot exemplars are drawn only from the 60% `train_df`. Because the chunk above reads the cached CSV whenever `gossip_bal` is not in memory, a fresh session (or anyone working from the GitHub copy) can run the modelling sections without re-loading the raw JSON or re-computing the split. (The earlier `gossipcop_split_assignments.csv` is now just an internal determinism aid for the first JSON run; it no longer needs to be shared.)
