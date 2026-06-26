@@ -1,0 +1,45 @@
+Model,subclass,n,Accuracy
+Logistic Regression,HF,699,0.7639484978540773
+Logistic Regression,MF,699,0.938483547925608
+Logistic Regression,HR,699,0.7339055793991416
+Logistic Regression,MR,699,0.899856938483548
+"Naive Bayes (Gaussian, TF-IDF)",HF,699,0.8397711015736766
+"Naive Bayes (Gaussian, TF-IDF)",MF,699,0.9713876967095852
+"Naive Bayes (Gaussian, TF-IDF)",HR,699,0.34334763948497854
+"Naive Bayes (Gaussian, TF-IDF)",MR,699,0.4721030042918455
+"Naive Bayes (multinomial, counts)",HF,699,0.7525035765379113
+"Naive Bayes (multinomial, counts)",MF,699,0.821173104434907
+"Naive Bayes (multinomial, counts)",HR,699,0.8011444921316166
+"Naive Bayes (multinomial, counts)",MR,699,0.8669527896995708
+Random Forest,HF,699,0.7067238912732475
+Random Forest,MF,699,0.9084406294706724
+Random Forest,HR,699,0.8583690987124464
+Random Forest,MR,699,0.9198855507868384
+BERT (fine-tuned),HF,699,0.7868383404864091
+BERT (fine-tuned),MF,699,0.9856938483547926
+BERT (fine-tuned),HR,699,0.7925608011444921
+BERT (fine-tuned),MR,699,0.915593705293276
+GPT-4o-mini (zero-shot),HF,699,0.47353361945636624
+GPT-4o-mini (zero-shot),MF,699,0.5221745350500715
+GPT-4o-mini (zero-shot),HR,699,0.9084406294706724
+GPT-4o-mini (zero-shot),MR,699,0.84406294706723894
+GPT-4o-mini (8-shot),HF,699,0.6280400572246065
+GPT-4o-mini (8-shot),MF,699,0.7424892703862661
+GPT-4o-mini (8-shot),HR,699,0.7410586552217453
+GPT-4o-mini (8-shot),MR,699,0.7124463519313304
+Claude Haiku 4.5 (zero-shot),HF,699,0.5021459227467812
+Claude Haiku 4.5 (zero-shot),MF,699,0.776824034334764
+Claude Haiku 4.5 (zero-shot),HR,699,0.8755364806866953
+Claude Haiku 4.5 (zero-shot),MR,699,0.7024320457796852
+Claude Haiku 4.5 (8-shot),HF,699,0.5021459227467812
+Claude Haiku 4.5 (8-shot),MF,699,0.84406294706723894
+Claude Haiku 4.5 (8-shot),HR,699,0.876967095851216
+Claude Haiku 4.5 (8-shot),MR,699,0.698140200286123
+Gemini 2.5 Flash (zero-shot),HF,699,0.17024320457796852
+Gemini 2.5 Flash (zero-shot),MF,699,0.6623748211731044
+Gemini 2.5 Flash (zero-shot),HR,699,0.977110157367668
+Gemini 2.5 Flash (zero-shot),MR,699,0.9041487839771102
+Gemini 2.5 Flash (8-shot),HF,699,0.35765379113018597
+Gemini 2.5 Flash (8-shot),MF,699,0.765379113018598
+Gemini 2.5 Flash (8-shot),HR,699,0.9484978540772532
+Gemini 2.5 Flash (8-shot),MR,699,0.8798283261802575

@@ -1,0 +1,7 @@
+Model,auto_parse_fail_pct,unresolved_after_review
+GPT-4o-mini (zero-shot),0,0
+GPT-4o-mini (8-shot),0,0
+Claude Haiku 4.5 (zero-shot),0,0
+Claude Haiku 4.5 (8-shot),0,0
+Gemini 2.5 Flash (zero-shot),0.072,2
+Gemini 2.5 Flash (8-shot),0,0
